@@ -17,11 +17,17 @@ from databricks.sdk.core import Config
 
 CFG = Config()  # uses the app service principal inside Databricks Apps
 WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
-CS = os.getenv("OT_CATALOG_SCHEMA", "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV")
-TY = f"{CS}.ECOMNOW_ORDERTIMING_V_TY"
-LY = f"{CS}.ECOMNOW_ORDERTIMING_V_LY"
-CUR = f"{CS}.ECOMNOW_CURRENTDATE"
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+
+# Hardcoded source objects (as requested)
+ORDER_HEADER = "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV.ECOMNOW_ORDER_HEADER_V"
+ORDER_DETAIL = "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV.ECOMNOW_ORDER_DETAIL_V"
+CONSIGNMENTS = "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV.ECOMNOW_CONSIGNMENTS_V"
+RETURNS = "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV.ECOMNOW_RETURNS_V"
+TY = "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV.ECOMNOW_ORDERTIMING_V_TY"
+LY = "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV.ECOMNOW_ORDERTIMING_V_LY"
+CUR = "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV.ECOMNOW_CURRENTDATE"
+STR_DETAILS = "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV.STR_DETAILS_OBF_V"
 
 _cache: dict = {}
 
@@ -78,18 +84,21 @@ METRICS = {
         "column": "demand",
         "title": "Demand by Hour",
         "fmt": lambda v: f"${v:,.0f}",
+        "agg": "CAST(SUM(DEMAND_REVENUE) AS DOUBLE)",
     },
     "orders": {
         "label": "Orders",
         "column": "orders",
         "title": "Orders by Hour",
         "fmt": lambda v: f"{v:,.0f}",
+        "agg": "COUNT(DISTINCT ORDER_ID)",
     },
     "shipping": {
         "label": "Shipping Revenue",
         "column": "shipping",
         "title": "Shipping Revenue by Hour",
         "fmt": lambda v: f"${v:,.0f}",
+        "agg": "CAST(SUM(SHIPPING_REVENUE) AS DOUBLE)",
     },
 }
 
@@ -107,6 +116,19 @@ def default_day() -> date:
 
 def kpi_card(id_):
     return dbc.Col(dbc.Card(dbc.CardBody(id=id_), className="shadow-sm text-center"), md=2)
+
+
+def load_filter_options(column_name: str, fallback: list[str]) -> list[str]:
+    try:
+        d = query(
+            both_periods(f"{column_name} AS v", "1=1", column_name)
+        )
+        if "v" not in d.columns:
+            return fallback
+        vals = [str(v) for v in sorted(d["v"].dropna().unique()) if str(v).strip()]
+        return vals or fallback
+    except Exception:  # noqa: BLE001
+        return fallback
 
 
 def serve_layout():
@@ -137,6 +159,10 @@ def serve_layout():
                 style_header={"fontWeight": "600", "backgroundColor": "#f8f9fa"},
                 merge_duplicate_headers=True,
                 fixed_rows={"headers": True},
+                style_data_conditional=[
+                    {"if": {"column_id": "order_hour"}, "textAlign": "left"},
+                    {"if": {"filter_query": '{order_hour} = "Total"'}, "fontWeight": "700"},
+                ],
             ),
         ]),
         dcc.Interval(id="tick", interval=5 * 60 * 1000),  # refresh every 5 min
@@ -192,16 +218,26 @@ def hour_label(hr: int) -> str:
     ],
 )
 def refresh(day, banners, ftypes, metric_tab, _):
+    if not day:
+        day = str(default_day())
+
+    banner_options = load_filter_options("BANNER", BANNERS)
+    ftype_options = load_filter_options("FULLFILLMENT_TYPE", FTYPES)
+    banners = banners or banner_options
+    ftypes = ftypes or ftype_options
+
     w, p = where_clause(day, banners, ftypes)
 
-    k = query(both_periods(KPI_SELECT, w), p).set_index("period").fillna(0)
+    kdf = query(both_periods(KPI_SELECT, w), p)
+    k = kdf.set_index("period").fillna(0) if "period" in kdf.columns else pd.DataFrame()
     t = k.loc["TY"].astype(float) if "TY" in k.index else EMPTY
     l = k.loc["LY"].astype(float) if "LY" in k.index else EMPTY
     aov = lambda r: r.demand / r.orders if r.orders else 0
     mgn = lambda r: (r.demand - r.cogs) / r.demand if r.demand else 0
     canc = lambda r: r.cancelled / r.orders if r.orders else 0
 
-    asof = query(f"SELECT CAST(MAX(CURRENTDATEEST) AS STRING) AS d FROM {CUR}")["d"].iloc[0]
+    asof_df = query(f"SELECT CAST(MAX(CURRENTDATEEST) AS STRING) AS d FROM {CUR}")
+    asof = asof_df["d"].iloc[0] if "d" in asof_df.columns and not asof_df.empty else "n/a"
 
     hr = query(both_periods(
         f"""
@@ -212,28 +248,52 @@ def refresh(day, banners, ftypes, metric_tab, _):
         """,
         w,
         HOUR_EXPR,
-    ), p).sort_values(["period", "hr"])
+    ), p)
+    for c, default in (("period", ""), ("hr", 0), ("demand", 0.0), ("orders", 0.0), ("shipping", 0.0)):
+        if c not in hr.columns:
+            hr[c] = default
+    hr = hr.sort_values(["period", "hr"])
 
     metric_key = metric_tab if metric_tab in METRICS else "demand"
     metric_col = METRICS[metric_key]["column"]
     metric_title = METRICS[metric_key]["title"]
 
     hrs = pd.DataFrame({"hr": list(range(24))})
+    hour_categories = [hour_label(h) for h in range(24)]
     fig_hour = go.Figure()
-    for per, color in (("LY", "#EA6B35"), ("TY", "#1E88E5")):
+    y_max = 0.0
+    y_min = 0.0
+    for per, color in (("LY", "#1E88E5"), ("TY", "#EA6B35")):
         d = hr[hr.period == per][["hr", metric_col]].copy()
         d = hrs.merge(d, on="hr", how="left").fillna({metric_col: 0})
+        y_max = max(y_max, float(d[metric_col].max()))
+        y_min = min(y_min, float(d[metric_col].min()))
         fig_hour.add_bar(
-            x=[hour_label(h) for h in d["hr"]],
+            x=hour_categories,
             y=d[metric_col],
             name=f"{METRICS[metric_key]['label']} {per}",
             marker_color=color,
         )
+    y_upper = (y_max * 1.1) if y_max > 0 else 1.0
+    y_lower = (y_min * 1.1) if y_min < 0 else 0.0
+    y_tickprefix = "$" if metric_key in ("demand", "shipping") else ""
     fig_hour.update_layout(
         title=metric_title,
         barmode="group",
-        xaxis=dict(title="ORDER_HR"),
-        yaxis=dict(title=METRICS[metric_key]["label"]),
+        bargap=0.22,
+        bargroupgap=0.08,
+        xaxis=dict(
+            title="ORDER_HR",
+            type="category",
+            categoryorder="array",
+            categoryarray=hour_categories,
+        ),
+        yaxis=dict(
+            title=METRICS[metric_key]["label"],
+            range=[y_lower, y_upper],
+            tickprefix=y_tickprefix,
+            tickformat=",.0f",
+        ),
         margin=dict(t=50),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
@@ -251,21 +311,20 @@ def refresh(day, banners, ftypes, metric_tab, _):
         w,
         f"{HOUR_EXPR}, BANNER",
     ), p)
+    for c, default in (("period", ""), ("hr", 0), ("BANNER", ""), ("demand", 0.0), ("orders", 0.0), ("shipping", 0.0), ("cogs", 0.0)):
+        if c not in comp.columns:
+            comp[c] = default
     comp = comp.fillna(0)
-    visible_banners = banners if banners else BANNERS
+    visible_banners = banners if banners else banner_options
 
     columns = [{"name": ["", "Order Hour"], "id": "order_hour"}]
+    metric_label = METRICS[metric_key]["label"]
+    metric_fmt = METRICS[metric_key]["fmt"]
     for b in visible_banners:
         columns.extend([
-            {"name": [b, "Demand TY"], "id": f"{b}__demand_ty"},
-            {"name": [b, "Demand LY"], "id": f"{b}__demand_ly"},
-            {"name": [b, "Demand % Change"], "id": f"{b}__demand_chg"},
-            {"name": [b, "Margin TY"], "id": f"{b}__margin_ty"},
-            {"name": [b, "Margin LY"], "id": f"{b}__margin_ly"},
-            {"name": [b, "Margin % Change"], "id": f"{b}__margin_chg"},
-            {"name": [b, "AOV TY"], "id": f"{b}__aov_ty"},
-            {"name": [b, "AOV LY"], "id": f"{b}__aov_ly"},
-            {"name": [b, "AOV % Change"], "id": f"{b}__aov_chg"},
+            {"name": [b, f"{metric_label} TY"], "id": f"{b}__ty"},
+            {"name": [b, f"{metric_label} LY"], "id": f"{b}__ly"},
+            {"name": [b, "% Change"], "id": f"{b}__chg"},
         ])
 
     def period_row(df_, period_, hr_, banner_):
@@ -283,22 +342,13 @@ def refresh(day, banners, ftypes, metric_tab, _):
             ty = period_row(comp, "TY", hr_i, b)
             ly = period_row(comp, "LY", hr_i, b)
 
-            margin_ty = safe_div(ty["demand"] - ty["cogs"], ty["demand"])
-            margin_ly = safe_div(ly["demand"] - ly["cogs"], ly["demand"])
-            aov_ty = safe_div(ty["demand"], ty["orders"])
-            aov_ly = safe_div(ly["demand"], ly["orders"])
+            ty_val = float(ty[metric_col])
+            ly_val = float(ly[metric_col])
+            row[f"{b}__ty"] = metric_fmt(ty_val)
+            row[f"{b}__ly"] = metric_fmt(ly_val)
+            row[f"{b}__chg"] = pct(pct_change(ty_val, ly_val)) if ly_val else "n/a"
 
-            row[f"{b}__demand_ty"] = money(ty["demand"])
-            row[f"{b}__demand_ly"] = money(ly["demand"])
-            row[f"{b}__demand_chg"] = pct(pct_change(ty["demand"], ly["demand"])) if ly["demand"] else "n/a"
-            row[f"{b}__margin_ty"] = pct(margin_ty)
-            row[f"{b}__margin_ly"] = pct(margin_ly)
-            row[f"{b}__margin_chg"] = pct(pct_change(margin_ty, margin_ly)) if margin_ly else "n/a"
-            row[f"{b}__aov_ty"] = money2(aov_ty)
-            row[f"{b}__aov_ly"] = money2(aov_ly)
-            row[f"{b}__aov_chg"] = pct(pct_change(aov_ty, aov_ly)) if aov_ly else "n/a"
-
-            has_data = has_data or bool(ty["demand"] or ly["demand"] or ty["orders"] or ly["orders"])
+            has_data = has_data or bool(ty_val or ly_val)
 
         if has_data:
             table_data.append(row)
@@ -314,20 +364,22 @@ def refresh(day, banners, ftypes, metric_tab, _):
         ty_cogs = float(bty["cogs"].sum())
         ly_cogs = float(bly["cogs"].sum())
 
-        margin_ty = safe_div(ty_demand - ty_cogs, ty_demand)
-        margin_ly = safe_div(ly_demand - ly_cogs, ly_demand)
-        aov_ty = safe_div(ty_demand, ty_orders)
-        aov_ly = safe_div(ly_demand, ly_orders)
+        ty_metrics = {
+            "demand": ty_demand,
+            "orders": ty_orders,
+            "shipping": float(bty["shipping"].sum()),
+        }
+        ly_metrics = {
+            "demand": ly_demand,
+            "orders": ly_orders,
+            "shipping": float(bly["shipping"].sum()),
+        }
+        ty_val = ty_metrics[metric_col]
+        ly_val = ly_metrics[metric_col]
 
-        total[f"{b}__demand_ty"] = money(ty_demand)
-        total[f"{b}__demand_ly"] = money(ly_demand)
-        total[f"{b}__demand_chg"] = pct(pct_change(ty_demand, ly_demand)) if ly_demand else "n/a"
-        total[f"{b}__margin_ty"] = pct(margin_ty)
-        total[f"{b}__margin_ly"] = pct(margin_ly)
-        total[f"{b}__margin_chg"] = pct(pct_change(margin_ty, margin_ly)) if margin_ly else "n/a"
-        total[f"{b}__aov_ty"] = money2(aov_ty)
-        total[f"{b}__aov_ly"] = money2(aov_ly)
-        total[f"{b}__aov_chg"] = pct(pct_change(aov_ty, aov_ly)) if aov_ly else "n/a"
+        total[f"{b}__ty"] = metric_fmt(ty_val)
+        total[f"{b}__ly"] = metric_fmt(ly_val)
+        total[f"{b}__chg"] = pct(pct_change(ty_val, ly_val)) if ly_val else "n/a"
     table_data.append(total)
 
     return (
