@@ -1,8 +1,10 @@
-command: ["python", "app.py"]
+command: ["python", "app_v2.py"]
 env:
   - name: DATABRICKS_WAREHOUSE_ID
     valueFrom: sql-warehouse
   - name: OT_CATALOG_SCHEMA
     value: "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV"
+  - name: DEMAND_CATALOG_SCHEMA
+    value: "sf_gold_dev_db.traffic_gold_dev"
   - name: CACHE_TTL_SECONDS
     value: "300"
