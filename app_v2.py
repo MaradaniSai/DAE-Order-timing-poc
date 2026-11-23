@@ -13,7 +13,7 @@ from databricks.sdk.core import Config
 CFG = Config()  # uses the app service principal inside Databricks Apps
 WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
-DEMAND_CATALOG_SCHEMA = os.getenv("DEMAND_CATALOG_SCHEMA", "GOLD_DEV_DB.TRAFFIC_GOLD_DEV")
+DEMAND_CATALOG_SCHEMA = os.getenv("DEMAND_CATALOG_SCHEMA", "SF_GOLD_DEV_DB.TRAFFIC_GOLD_DEV")
 
 # Order Timing objects
 TY = "sf_PLATINUM_DEV_DB.CUSTOMER_PLATINUM_DEV.ECOMNOW_ORDERTIMING_V_TY"
@@ -187,14 +187,18 @@ APP_CSS = """
         .subtle {color:#6B778C; font-size:12px;}
         .filters-label {font-size:12px; font-weight:600; color:#1D2B44; margin-bottom:4px;}
         .tile {background:#fff; border:1px solid #E6ECF5; border-radius:8px; box-shadow:0 1px 2px rgba(20,36,64,.05);}
-        .kpi-title {font-size:12px; text-transform:uppercase; color:#6A7892; letter-spacing:.04em;}
-        .kpi-value {font-size:34px; font-weight:800; line-height:1.1; color:#0F1B2D;}
-        .kpi-sub {font-size:13px; font-weight:600;}
+        .kpi-title {font-size:12px; text-transform:uppercase; color:#6A7892; letter-spacing:.04em; font-weight:600;}
+        .kpi-value {font-size:32px; font-weight:800; line-height:1.2; color:#0F1B2D; margin:8px 0;}
+        .kpi-sub {font-size:12px; font-weight:600; margin-top:4px;}
+        .kpi-delta-positive {color:#16A57A;}
+        .kpi-delta-negative {color:#E33E3E;}
         .metric-tab .nav-link {border:1px solid #CFD8E3 !important; border-radius:4px !important; margin-right:6px; color:#2B3D5A; font-weight:600; padding:3px 12px; font-size:13px;}
         .metric-tab .nav-link.active {background:#D4A51B !important; color:#fff !important; border-color:#D4A51B !important;}
         .main-tab .nav-link {border:1px solid #D5B15A !important; color:#876100 !important; background:#fff; font-weight:700; padding:6px 18px; border-radius:4px !important; margin-right:8px;}
         .main-tab .nav-link.active {background:#D4A51B !important; color:#fff !important;}
         .chip {display:inline-block; background:#D4A51B; color:#fff; font-size:16px; font-weight:700; padding:6px 16px; border-radius:6px; margin:6px 0;}
+        .excluded-fraud-label {color:#6B778C; font-size:12px; font-weight:600; text-align:right; padding-top:4px;}
+        .dr-card-body {padding:16px 12px; display:flex; flex-direction:column; align-items:center; justify-content:center;}
 """
 app.index_string = app.index_string.replace("{%css%}", "{%css%}<style>" + APP_CSS + "</style>")
 
@@ -225,27 +229,14 @@ def card(title, ty, ly, fmt):
 
 
 def dr_card(title: str, val: str, delta_text: str, positive: bool = True):
-    return [html.Div(title, className="kpi-title"), html.Div(val, className="kpi-value"), html.Div(delta_text, className="kpi-sub", style={"color": "#16A57A" if positive else "#E33E3E"})]
+    delta_class = "kpi-delta-positive" if positive else "kpi-delta-negative"
+    return [
+        html.Div(title, className="kpi-title"),
+        html.Div(val, className="kpi-value"),
+        html.Div(delta_text, className=f"kpi-sub {delta_class}")
+    ]
 
 
-def format_df_for_table(df: pd.DataFrame, max_rows: int = 300):
-    if df.empty:
-        return [], []
-    out = df.copy().head(max_rows)
-    for c in out.columns:
-        uc = c.upper()
-        if pd.api.types.is_datetime64_any_dtype(out[c]):
-            out[c] = out[c].dt.strftime("%Y-%m-%d")
-        elif pd.api.types.is_numeric_dtype(out[c]):
-            if any(k in uc for k in ["PCT", "GM", "MARGIN", "%"]):
-                out[c] = out[c].apply(lambda v: f"{float(v):.2f}%" if pd.notna(v) else "")
-            elif any(k in uc for k in ["REV", "AMOUNT", "DEMAND", "PRICE", "SALES", "VALUE"]):
-                out[c] = out[c].apply(lambda v: f"${float(v):,.2f}" if pd.notna(v) else "")
-            elif any(k in uc for k in ["COUNT", "QTY", "UNITS", "ORDERS"]):
-                out[c] = out[c].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "")
-            else:
-                out[c] = out[c].apply(lambda v: f"{float(v):,.2f}" if pd.notna(v) else "")
-    return [{"name": str(c).replace("_", " "), "id": c} for c in out.columns], out.to_dict("records")
 
 
 def demand_filter_values() -> tuple[list[str], list[str], list[str]]:
@@ -260,6 +251,188 @@ def demand_filter_values() -> tuple[list[str], list[str], list[str]]:
     cancels = sorted([str(v) for v in d[cancel_col].dropna().unique()]) if cancel_col else []
     sources = sorted([str(v) for v in d[source_col].dropna().unique()]) if source_col else []
     return banners or BANNERS, cancels, sources
+
+
+def format_banner_channel_table(df: pd.DataFrame) -> tuple[list[dict], list[dict]]:
+    """Format RT_DEMAND_BANNER_CHANNEL_V data with Channel vs Banner comparison."""
+    if df.empty:
+        return [], []
+    
+    # Get column names
+    cols = list(df.columns)
+    banner_col = find_col(cols, ["BANNER"])
+    channel_col = find_col(cols, ["CHANNEL"])
+    order_col = find_col(cols, ["ORDERS"])
+    demand_col = find_col(cols, ["DEMAND"])
+    cogs_col = find_col(cols, ["COGS"])
+    
+    if not (banner_col and channel_col and order_col and demand_col):
+        return [], []
+    
+    # Group by banner and channel
+    pivot_data = {}
+    for _, row in df.iterrows():
+        banner = str(row[banner_col])
+        channel = str(row[channel_col])
+        
+        if banner not in pivot_data:
+            pivot_data[banner] = {}
+        
+        orders = float(row[order_col]) if pd.notna(row[order_col]) else 0.0
+        demand = float(row[demand_col]) if pd.notna(row[demand_col]) else 0.0
+        cogs = float(row[cogs_col]) if pd.notna(row[cogs_col]) else 0.0
+        
+        pivot_data[banner][channel] = {
+            "orders": orders,
+            "demand": demand,
+            "cogs": cogs,
+            "aov": demand / orders if orders > 0 else 0.0,
+            "gm": (cogs / demand * 100) if demand > 0 else 0.0,
+        }
+    
+    # Build table rows
+    rows = []
+    all_channels = set()
+    for banner_data in pivot_data.values():
+        all_channels.update(banner_data.keys())
+    all_channels = sorted(list(all_channels))
+    
+    for banner in sorted(pivot_data.keys()):
+        row = {"Banner": banner}
+        total_orders = 0
+        total_demand = 0.0
+        
+        for channel in all_channels:
+            if channel in pivot_data[banner]:
+                data = pivot_data[banner][channel]
+                row[f"{channel}_Count"] = f"{int(data['orders']):,}"
+                row[f"{channel}_AOV"] = f"${data['aov']:,.2f}"
+                row[f"{channel}_GM"] = f"{data['gm']:.2f}%"
+                row[f"{channel}_Amount"] = f"${data['demand']:,.2f}"
+                total_orders += data['orders']
+                total_demand += data['demand']
+            else:
+                row[f"{channel}_Count"] = "0"
+                row[f"{channel}_AOV"] = "$0.00"
+                row[f"{channel}_GM"] = "0.00%"
+                row[f"{channel}_Amount"] = "$0.00"
+        
+        row["Total_Count"] = f"{int(total_orders):,}"
+        row["Total_Amount"] = f"${total_demand:,.2f}"
+        rows.append(row)
+    
+    # Create columns
+    columns = [{"name": "Banner", "id": "Banner"}]
+    for channel in all_channels:
+        columns.extend([
+            {"name": [channel, "Count"], "id": f"{channel}_Count"},
+            {"name": [channel, "AOV"], "id": f"{channel}_AOV"},
+            {"name": [channel, "GM"], "id": f"{channel}_GM"},
+            {"name": [channel, "Amount"], "id": f"{channel}_Amount"},
+        ])
+    columns.extend([
+        {"name": ["Total", "Count"], "id": "Total_Count"},
+        {"name": ["Total", "Amount"], "id": "Total_Amount"},
+    ])
+    
+    return columns, rows
+
+
+def format_sku_table(df: pd.DataFrame) -> tuple[list[dict], list[dict]]:
+    """Format RT_DEMAND_SKU_V data with SKU details."""
+    if df.empty:
+        return [], []
+    
+    cols = list(df.columns)
+    sku_col = find_col(cols, ["SKU"])
+    desc_col = find_col(cols, ["DESCRIPTION"])
+    units_col = find_col(cols, ["UNITS"])
+    revenue_col = find_col(cols, ["REVENUE"])
+    cogs_col = find_col(cols, ["COGS"])
+    list_price_col = find_col(cols, ["LIST_AMOUNT"])
+    
+    rows = []
+    for _, row in df.iterrows():
+        sku = str(row[sku_col]) if sku_col and pd.notna(row[sku_col]) else ""
+        desc = str(row[desc_col]) if desc_col and pd.notna(row[desc_col]) else ""
+        units = int(row[units_col]) if units_col and pd.notna(row[units_col]) else 0
+        revenue = float(row[revenue_col]) if revenue_col and pd.notna(row[revenue_col]) else 0.0
+        cogs = float(row[cogs_col]) if cogs_col and pd.notna(row[cogs_col]) else 0.0
+        list_price = float(row[list_price_col]) if list_price_col and pd.notna(row[list_price_col]) else 0.0
+        
+        gm_pct = (cogs / revenue * 100) if revenue > 0 else 0.0
+        pct_off = ((list_price - revenue) / list_price * 100) if list_price > 0 else 0.0
+        
+        rows.append({
+            "SKU": sku,
+            "Description": desc,
+            "Units": f"{units:,}",
+            "Rev": f"${revenue:,.2f}",
+            "GM": f"{gm_pct:.2f}%",
+            "% Off": f"{pct_off:.2f}%",
+        })
+    
+    columns = [
+        {"name": "SKU", "id": "SKU"},
+        {"name": "Description", "id": "Description"},
+        {"name": "Units", "id": "Units"},
+        {"name": "Rev", "id": "Rev"},
+        {"name": "GM", "id": "GM"},
+        {"name": "% Off", "id": "% Off"},
+    ]
+    
+    return columns, rows
+
+
+def format_order_detail_table(df: pd.DataFrame) -> tuple[list[dict], list[dict]]:
+    """Format RT_DEMAND_ORDER_DETAIL_V data with order line details."""
+    if df.empty:
+        return [], []
+    
+    cols = list(df.columns)
+    company_col = find_col(cols, ["COMPANY_NUMBER"])
+    order_col = find_col(cols, ["ORDER_ID"])
+    source_col = find_col(cols, ["SOURCE_CODE"])
+    sku_col = find_col(cols, ["SKU"])
+    size_col = find_col(cols, ["SIZE"])
+    qty_col = find_col(cols, ["QUANTITY_ORDERED", "QUANTITY"])
+    list_price_col = find_col(cols, ["UNIT_LIST_PRICE"])
+    net_price_col = find_col(cols, ["UNIT_NET_PRICE"])
+    
+    rows = []
+    for _, row in df.iterrows():
+        company = str(row[company_col]) if company_col and pd.notna(row[company_col]) else ""
+        order_id = str(row[order_col]) if order_col and pd.notna(row[order_col]) else ""
+        source = str(row[source_col]) if source_col and pd.notna(row[source_col]) else ""
+        sku = str(row[sku_col]) if sku_col and pd.notna(row[sku_col]) else ""
+        size = str(row[size_col]) if size_col and pd.notna(row[size_col]) else ""
+        qty = int(row[qty_col]) if qty_col and pd.notna(row[qty_col]) else 0
+        list_price = float(row[list_price_col]) if list_price_col and pd.notna(row[list_price_col]) else 0.0
+        net_price = float(row[net_price_col]) if net_price_col and pd.notna(row[net_price_col]) else 0.0
+        
+        rows.append({
+            "Company": company,
+            "Order Number": order_id,
+            "Source Code": source,
+            "SKU": sku,
+            "Size": size,
+            "Qty Ordered": f"{qty:,}",
+            "Unit List Price": f"${list_price:,.2f}",
+            "Unit Net Price": f"${net_price:,.2f}",
+        })
+    
+    columns = [
+        {"name": "Company", "id": "Company"},
+        {"name": "Order Number", "id": "Order Number"},
+        {"name": "Source Code", "id": "Source Code"},
+        {"name": "SKU", "id": "SKU"},
+        {"name": "Size", "id": "Size"},
+        {"name": "Qty Ordered", "id": "Qty Ordered"},
+        {"name": "Unit List Price", "id": "Unit List Price"},
+        {"name": "Unit Net Price", "id": "Unit Net Price"},
+    ]
+    
+    return columns, rows
 
 
 def demand_kpis(start_date, end_date, banners, cancel_codes, source_codes):
@@ -348,24 +521,27 @@ def order_timing_layout():
 def demand_review_layout():
     start_default, end_default = default_demand_range()
     return html.Div([
-        dbc.Row([dbc.Col(html.H2("Demand Review"), md=8), dbc.Col(html.Div("# Excluded Fraud", className="subtle text-end mt-2"), md=4)]),
-        html.Div(id="dr-last-refresh", className="subtle mb-2"),
+        dbc.Row([
+            dbc.Col(html.Div("Demand Review", style={"fontSize": "24px", "fontWeight": "700", "color": "#0F1B2D"}), md=8),
+            dbc.Col(html.Div("# Excluded Fraud", className="excluded-fraud-label"), md=4),
+        ], className="mb-2"),
+        html.Div(id="dr-last-refresh", className="subtle mb-3"),
         dbc.Row([
             dbc.Col([html.Div("Banner", className="filters-label"), dcc.Dropdown(id="dr-banner", multi=True, placeholder="All")], md=4),
             dbc.Col([html.Div("Cancel Code", className="filters-label"), dcc.Dropdown(id="dr-cancel", multi=True, placeholder="All")], md=2),
             dbc.Col([html.Div("Source Code", className="filters-label"), dcc.Dropdown(id="dr-source", multi=True, placeholder="All")], md=2),
             dbc.Col([html.Div("Date", className="filters-label"), dcc.DatePickerRange(id="dr-date-range", start_date=start_default, end_date=end_default, display_format="YYYY-MM-DD")], md=4),
-        ], className="g-2 mb-3"),
+        ], className="g-2 mb-4"),
         dbc.Row([
-            dbc.Col(dbc.Card(dbc.CardBody(id="dr-k-total-demand"), className="shadow-sm text-center"), md=2),
-            dbc.Col(dbc.Card(dbc.CardBody(id="dr-k-orders"), className="shadow-sm text-center"), md=2),
-            dbc.Col(dbc.Card(dbc.CardBody(id="dr-k-aov"), className="shadow-sm text-center"), md=2),
-            dbc.Col(dbc.Card(dbc.CardBody(id="dr-k-gm"), className="shadow-sm text-center"), md=2),
-            dbc.Col(dbc.Card(dbc.CardBody(id="dr-k-banners"), className="shadow-sm text-center"), md=2),
-        ], className="g-2 mb-3"),
-        dbc.Card(dbc.CardBody([html.H4("Demand by Channel", className="mb-2"), dash_table.DataTable(id="dr-banner-channel-table", page_action="none", style_table={"overflowX": "auto", "maxHeight": "360px", "overflowY": "auto"}, style_cell={"fontFamily": "Segoe UI, Arial", "fontSize": "12px", "padding": "6px", "whiteSpace": "nowrap"}, style_header={"fontWeight": "700", "backgroundColor": "#EFF3F9", "color": "#32435F"})]), className="tile mb-3"),
-        dbc.Card(dbc.CardBody([html.H4("SKU Detail", className="mb-2"), dash_table.DataTable(id="dr-sku-table", page_action="none", style_table={"overflowX": "auto", "maxHeight": "320px", "overflowY": "auto"}, style_cell={"fontFamily": "Segoe UI, Arial", "fontSize": "12px", "padding": "6px", "whiteSpace": "nowrap"}, style_header={"fontWeight": "700", "backgroundColor": "#EFF3F9", "color": "#32435F"})]), className="tile mb-3"),
-        dbc.Card(dbc.CardBody([html.H4("Order Detail", className="mb-2"), dash_table.DataTable(id="dr-order-table", page_size=10, style_table={"overflowX": "auto"}, style_cell={"fontFamily": "Segoe UI, Arial", "fontSize": "12px", "padding": "6px", "whiteSpace": "nowrap"}, style_header={"fontWeight": "700", "backgroundColor": "#EFF3F9", "color": "#32435F"})]), className="tile mb-3"),
+            dbc.Col(dbc.Card(dbc.CardBody(id="dr-k-total-demand", className="dr-card-body"), className="tile"), md=2),
+            dbc.Col(dbc.Card(dbc.CardBody(id="dr-k-orders", className="dr-card-body"), className="tile"), md=2),
+            dbc.Col(dbc.Card(dbc.CardBody(id="dr-k-aov", className="dr-card-body"), className="tile"), md=2),
+            dbc.Col(dbc.Card(dbc.CardBody(id="dr-k-gm", className="dr-card-body"), className="tile"), md=2),
+            dbc.Col(dbc.Card(dbc.CardBody(id="dr-k-banners", className="dr-card-body"), className="tile"), md=2),
+        ], className="g-2 mb-4"),
+        dbc.Card(dbc.CardBody([html.H4("Demand by Channel", className="mb-3", style={"fontSize": "16px", "fontWeight": "700"}), dash_table.DataTable(id="dr-banner-channel-table", page_action="none", style_table={"overflowX": "auto", "maxHeight": "360px", "overflowY": "auto"}, style_cell={"fontFamily": "Segoe UI, Arial", "fontSize": "12px", "padding": "8px", "whiteSpace": "nowrap", "textAlign": "right"}, style_cell_conditional=[{"if": {"column_id": "Banner"}, "textAlign": "left"}], style_header={"fontWeight": "700", "backgroundColor": "#F3F8FF", "color": "#223A5E", "textAlign": "center", "borderRight": "1px solid #E6ECF5"}, style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#fafbfc"}])]), className="tile mb-4"),
+        dbc.Card(dbc.CardBody([html.H4("SKU Detail", className="mb-3", style={"fontSize": "16px", "fontWeight": "700"}), dash_table.DataTable(id="dr-sku-table", page_action="none", style_table={"overflowX": "auto", "maxHeight": "360px", "overflowY": "auto"}, style_cell={"fontFamily": "Segoe UI, Arial", "fontSize": "12px", "padding": "8px", "whiteSpace": "nowrap", "textAlign": "right"}, style_cell_conditional=[{"if": {"column_id": c}, "textAlign": "left"} for c in ["SKU", "Description"]], style_header={"fontWeight": "700", "backgroundColor": "#F3F8FF", "color": "#223A5E", "textAlign": "center"}, style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#fafbfc"}])]), className="tile mb-4"),
+        dbc.Card(dbc.CardBody([html.H4("Order Detail", className="mb-3", style={"fontSize": "16px", "fontWeight": "700"}), dash_table.DataTable(id="dr-order-table", page_size=10, style_table={"overflowX": "auto"}, style_cell={"fontFamily": "Segoe UI, Arial", "fontSize": "12px", "padding": "8px", "whiteSpace": "nowrap", "textAlign": "right"}, style_cell_conditional=[{"if": {"column_id": c}, "textAlign": "left"} for c in ["Order Number", "Source Code", "SKU", "Description"]], style_header={"fontWeight": "700", "backgroundColor": "#F3F8FF", "color": "#223A5E", "textAlign": "center"})]), className="tile mb-3"),
         dcc.Interval(id="dr-tick", interval=5 * 60 * 1000),
     ])
 
@@ -399,12 +575,16 @@ def refresh_demand_review(start_date, end_date, banners, cancel_codes, source_co
     orders_delta = pct_change(orders_now, orders_ly)
     aov_delta = pct_change(aov_now, aov_ly)
     gm_delta_pp = gm_now - gm_ly
+    
+    # Fetch and format tables
     channel_df = build_filtered_view(DEMAND_BANNER_CHANNEL_V, start_date, end_date, banners, cancel_codes, source_codes, limit_rows=500)
     sku_df = build_filtered_view(DEMAND_SKU_V, start_date, end_date, banners, cancel_codes, source_codes, limit_rows=300)
     order_df = build_filtered_view(DEMAND_ORDER_DETAIL_V, start_date, end_date, banners, cancel_codes, source_codes, limit_rows=500)
-    channel_cols, channel_data = format_df_for_table(channel_df, max_rows=500)
-    sku_cols, sku_data = format_df_for_table(sku_df, max_rows=300)
-    order_cols, order_data = format_df_for_table(order_df, max_rows=500)
+    
+    channel_cols, channel_data = format_banner_channel_table(channel_df)
+    sku_cols, sku_data = format_sku_table(sku_df)
+    order_cols, order_data = format_order_detail_table(order_df)
+    
     return (
         f"Last refresh: {pd.Timestamp.utcnow().strftime('%m/%d/%Y %H:%M UTC')}",
         dr_card("TOTAL DEMAND", money(demand_now), f"▲ {demand_delta:+.1%} vs LY" if demand_delta is not None else "n/a", (demand_delta or 0) >= 0),
