@@ -80,6 +80,16 @@ def find_col(columns: list[str], candidates: list[str]) -> str | None:
     return None
 
 
+def debug_columns(df: pd.DataFrame, table_name: str):
+    """Debug helper: Print all columns in a dataframe"""
+    if df.empty:
+        print(f"{table_name}: DataFrame is empty")
+        return
+    cols = list(df.columns)
+    print(f"{table_name} columns: {cols}")
+    print(f"{table_name} first row: {df.iloc[0].to_dict() if len(df) > 0 else 'No data'}")
+
+
 def sql_in_filter(col: str | None, vals: list[str] | None, prefix: str, parts: list[str], params: dict):
     if not col or not vals:
         return
@@ -347,7 +357,8 @@ def format_sku_table(df: pd.DataFrame) -> tuple[list[dict], list[dict]]:
     sku_col = find_col(cols, ["SKU"])
     desc_col = find_col(cols, ["DESCRIPTION"])
     units_col = find_col(cols, ["UNITS"])
-    revenue_col = find_col(cols, ["REVENUE"])
+    # Try different column names for revenue
+    revenue_col = find_col(cols, ["REVENUE", "DEMAND", "DEMAND_WITH_COST"])
     cogs_col = find_col(cols, ["COGS"])
     list_price_col = find_col(cols, ["LIST_AMOUNT"])
     
@@ -360,7 +371,9 @@ def format_sku_table(df: pd.DataFrame) -> tuple[list[dict], list[dict]]:
         cogs = float(row[cogs_col]) if cogs_col and pd.notna(row[cogs_col]) else 0.0
         list_price = float(row[list_price_col]) if list_price_col and pd.notna(row[list_price_col]) else 0.0
         
+        # GM% = COGS / Revenue (displayed as percentage)
         gm_pct = (cogs / revenue * 100) if revenue > 0 else 0.0
+        # % Off = (List Price - Revenue) / List Price (only if list_price exists)
         pct_off = ((list_price - revenue) / list_price * 100) if list_price > 0 else 0.0
         
         rows.append({
@@ -390,14 +403,15 @@ def format_order_detail_table(df: pd.DataFrame) -> tuple[list[dict], list[dict]]
         return [], []
     
     cols = list(df.columns)
-    company_col = find_col(cols, ["COMPANY_NUMBER"])
-    order_col = find_col(cols, ["ORDER_ID"])
-    source_col = find_col(cols, ["SOURCE_CODE"])
+    company_col = find_col(cols, ["COMPANY_NUMBER", "COMPANY"])
+    order_col = find_col(cols, ["ORDER_ID", "ORDER_NUMBER"])
+    source_col = find_col(cols, ["SOURCE_CODE", "SOURCE"])
     sku_col = find_col(cols, ["SKU"])
     size_col = find_col(cols, ["SIZE"])
-    qty_col = find_col(cols, ["QUANTITY_ORDERED", "QUANTITY"])
-    list_price_col = find_col(cols, ["UNIT_LIST_PRICE"])
-    net_price_col = find_col(cols, ["UNIT_NET_PRICE"])
+    qty_col = find_col(cols, ["QUANTITY_ORDERED", "QUANTITY", "QTY_ORDERED", "QTY"])
+    # Try multiple price column names
+    list_price_col = find_col(cols, ["UNIT_LIST_PRICE", "LIST_PRICE", "UNIT_PRICE", "PRICE"])
+    net_price_col = find_col(cols, ["UNIT_NET_PRICE", "NET_PRICE", "UNIT_NET_AMOUNT"])
     
     rows = []
     for _, row in df.iterrows():
@@ -410,13 +424,17 @@ def format_order_detail_table(df: pd.DataFrame) -> tuple[list[dict], list[dict]]
         list_price = float(row[list_price_col]) if list_price_col and pd.notna(row[list_price_col]) else 0.0
         net_price = float(row[net_price_col]) if net_price_col and pd.notna(row[net_price_col]) else 0.0
         
+        # Handle negative prices by taking absolute value
+        list_price = abs(list_price)
+        net_price = abs(net_price)
+        
         rows.append({
             "Company": company,
             "Order Number": order_id,
             "Source Code": source,
             "SKU": sku,
             "Size": size,
-            "Qty Ordered": f"{qty:,}",
+            "Qty Ordered": f"{qty:,}" if qty > 0 else "0",
             "Unit List Price": f"${list_price:,.2f}",
             "Unit Net Price": f"${net_price:,.2f}",
         })
